@@ -1,0 +1,297 @@
+import streamlit as st
+import requests
+import pandas as pd
+import sqlite3
+from datetime import datetime
+import time
+import json
+import matplotlib.pyplot as plt
+from sklearn.ensemble import IsolationForest
+
+# Load config
+def load_config():
+    with open("config.json", "r") as f:
+        return json.load(f)
+
+# Save config
+def save_config(config):
+    with open("config.json", "w") as f:
+        json.dump(config, f, indent=4)
+
+# Initialize SQLite database
+def init_db():
+    conn = sqlite3.connect(config["database_name"])
+    cursor = conn.cursor()
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS tokens (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            token_address TEXT,
+            symbol TEXT,
+            price REAL,
+            volume REAL,
+            liquidity REAL,
+            timestamp DATETIME,
+            event TEXT,
+            dev_address TEXT,
+            is_fake_volume BOOLEAN,
+            is_bundled_supply BOOLEAN,
+            rugcheck_status TEXT
+        )
+    ''')
+    conn.commit()
+    conn.close()
+
+# Fetch data from DexScreener
+def fetch_token_data(token_address):
+    url = f"{config['dex_screener_api_url']}{token_address}"
+    response = requests.get(url)
+    if response.status_code == 200:
+        return response.json()
+    else:
+        st.error(f"Failed to fetch data for token {token_address}")
+        return None
+
+# Check if token passes filters
+def passes_filters(token):
+    price_change = float(token['priceChange']['h24'])
+    volume = float(token['volume']['h24'])
+    liquidity = float(token['liquidity']['usd'])
+    volume_liquidity_ratio = volume / liquidity if liquidity > 0 else 0
+    return (
+        liquidity >= config["filters"]["min_liquidity"] and
+        volume >= config["filters"]["min_volume"] and
+        abs(price_change) <= config["filters"]["max_price_change_24h"] and
+        volume_liquidity_ratio <= config["filters"]["max_volume_liquidity_ratio"]
+    )
+
+# Check if token is blacklisted
+def is_blacklisted(token):
+    token_address = token['baseToken']['address']
+    dev_address = token['baseToken'].get('devAddress', '')
+    return (
+        token_address in config["blacklist"]["coins"] or
+        dev_address in config["blacklist"]["devs"]
+    )
+
+# Validate volume using Pocket Universe API
+def validate_volume(token_address):
+    headers = {"Authorization": f"Bearer {config['pocket_universe_api_key']}"}
+    payload = {"token_address": token_address}
+    response = requests.post(config["pocket_universe_api_url"], headers=headers, json=payload)
+    if response.status_code == 200:
+        data = response.json()
+        return not data.get("is_fake_volume", False)
+    else:
+        st.error(f"Failed to validate volume for token {token_address}")
+        return False
+
+# Check Rugcheck.xyz for contract status
+def check_rugcheck(token_address):
+    headers = {"Authorization": f"Bearer {config['rugcheck_api_key']}"}
+    payload = {"token_address": token_address}
+    response = requests.post(config["rugcheck_api_url"], headers=headers, json=payload)
+    if response.status_code == 200:
+        data = response.json()
+        return data.get("status", "Unknown") == "Good"
+    else:
+        st.error(f"Failed to check Rugcheck for token {token_address}")
+        return False
+
+# Check if token supply is bundled
+def is_bundled_supply(token):
+    top_holders = token.get('holders', [])
+    if not top_holders:
+        return False
+    total_supply = float(token['totalSupply'])
+    top_10_holdings = sum(float(h['balance']) for h in top_holders[:10])
+    return (top_10_holdings / total_supply) > 0.9
+
+# Send Telegram notification
+def send_telegram_message(message):
+    url = f"https://api.telegram.org/bot{config['telegram_bot_token']}/sendMessage"
+    payload = {
+        "chat_id": config["telegram_chat_id"],
+        "text": message
+    }
+    response = requests.post(url, json=payload)
+    if response.status_code != 200:
+        st.error(f"Failed to send Telegram message: {response.text}")
+
+# Execute trade using BonkBot
+def execute_trade(token_address, action):
+    headers = {"Authorization": f"Bearer {config['bonkbot_api_key']}"}
+    payload = {
+        "token_address": token_address,
+        "action": action
+    }
+    response = requests.post(config["bonkbot_api_url"], headers=headers, json=payload)
+    if response.status_code == 200:
+        send_telegram_message(f"{action.capitalize()} executed for token: {token_address}")
+    else:
+        st.error(f"Failed to execute {action} for token {token_address}: {response.text}")
+
+# Parse and save token data
+def save_token_data(token_data, is_fake_volume=False, is_bundled_supply=False, rugcheck_status="Unknown"):
+    conn = sqlite3.connect(config["database_name"])
+    cursor = conn.cursor()
+    token = token_data['pairs'][0]
+    token_address = token['baseToken']['address']
+    symbol = token['baseToken']['symbol']
+    price = float(token['priceUsd'])
+    volume = float(token['volume']['h24'])
+    liquidity = float(token['liquidity']['usd'])
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    event = detect_event(token)
+    dev_address = token['baseToken'].get('devAddress', '')
+    cursor.execute('''
+        INSERT INTO tokens (token_address, symbol, price, volume, liquidity, timestamp, event, dev_address, is_fake_volume, is_bundled_supply, rugcheck_status)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ''', (token_address, symbol, price, volume, liquidity, timestamp, event, dev_address, is_fake_volume, is_bundled_supply, rugcheck_status))
+    conn.commit()
+    conn.close()
+
+# Detect events (rug, pump, CEX listing, etc.)
+def detect_event(token):
+    price_change = float(token['priceChange']['h24'])
+    volume_change = float(token['volumeChange']['h24'])
+    liquidity_change = float(token['liquidityChange']['h24'])
+
+    if price_change > 100 and volume_change > 500:
+        return "pump"
+    elif price_change < -90 and liquidity_change < -90:
+        return "rug"
+    elif "CEX" in token.get('description', ''):
+        return "cex_listing"
+    else:
+        return "normal"
+
+# Analyze patterns using Isolation Forest (anomaly detection)
+def analyze_patterns():
+    conn = sqlite3.connect(config["database_name"])
+    df = pd.read_sql_query("SELECT * FROM tokens", conn)
+    conn.close()
+
+    # Feature engineering
+    df['price_volume_ratio'] = df['price'] / df['volume']
+    df['liquidity_volume_ratio'] = df['liquidity'] / df['volume']
+
+    # Anomaly detection
+    model = IsolationForest(contamination=0.1)
+    df['anomaly'] = model.fit_predict(df[['price_volume_ratio', 'liquidity_volume_ratio']])
+    anomalies = df[df['anomaly'] == -1]
+
+    # Plot anomalies
+    fig, ax = plt.subplots()
+    ax.scatter(df['price_volume_ratio'], df['liquidity_volume_ratio'], c=df['anomaly'], cmap='viridis')
+    ax.set_xlabel('Price/Volume Ratio')
+    ax.set_ylabel('Liquidity/Volume Ratio')
+    ax.set_title('Anomaly Detection in Token Data')
+    st.pyplot(fig)
+
+    return anomalies
+
+# Streamlit UI
+def main():
+    st.title("Crypto Trading Bot")
+    st.sidebar.header("Configuration")
+
+    # Load config
+    global config
+    config = load_config()
+
+    # Configuration form
+    with st.sidebar.form("config_form"):
+        st.write("API Keys")
+        dex_screener_api_url = st.text_input("DexScreener API URL", value=config["dex_screener_api_url"])
+        pocket_universe_api_url = st.text_input("Pocket Universe API URL", value=config["pocket_universe_api_url"])
+        pocket_universe_api_key = st.text_input("Pocket Universe API Key", value=config["pocket_universe_api_key"])
+        rugcheck_api_url = st.text_input("Rugcheck API URL", value=config["rugcheck_api_url"])
+        rugcheck_api_key = st.text_input("Rugcheck API Key", value=config["rugcheck_api_key"])
+        telegram_bot_token = st.text_input("Telegram Bot Token", value=config["telegram_bot_token"])
+        telegram_chat_id = st.text_input("Telegram Chat ID", value=config["telegram_chat_id"])
+        bonkbot_api_url = st.text_input("BonkBot API URL", value=config["bonkbot_api_url"])
+        bonkbot_api_key = st.text_input("BonkBot API Key", value=config["bonkbot_api_key"])
+        database_name = st.text_input("Database Name", value=config["database_name"])
+        update_interval = st.number_input("Update Interval (seconds)", value=config["update_interval"])
+        min_liquidity = st.number_input("Minimum Liquidity", value=config["filters"]["min_liquidity"])
+        min_volume = st.number_input("Minimum Volume", value=config["filters"]["min_volume"])
+        max_price_change_24h = st.number_input("Maximum Price Change (24h)", value=config["filters"]["max_price_change_24h"])
+        max_volume_liquidity_ratio = st.number_input("Maximum Volume/Liquidity Ratio", value=config["filters"]["max_volume_liquidity_ratio"])
+        coin_blacklist = st.text_area("Coin Blacklist", value="\n".join(config["blacklist"]["coins"]))
+        dev_blacklist = st.text_area("Dev Blacklist", value="\n".join(config["blacklist"]["devs"]))
+        submitted = st.form_submit_button("Save Configuration")
+
+    if submitted:
+        config = {
+            "dex_screener_api_url": dex_screener_api_url,
+            "pocket_universe_api_url": pocket_universe_api_url,
+            "pocket_universe_api_key": pocket_universe_api_key,
+            "rugcheck_api_url": rugcheck_api_url,
+            "rugcheck_api_key": rugcheck_api_key,
+            "telegram_bot_token": telegram_bot_token,
+            "telegram_chat_id": telegram_chat_id,
+            "bonkbot_api_url": bonkbot_api_url,
+            "bonkbot_api_key": bonkbot_api_key,
+            "database_name": database_name,
+            "update_interval": update_interval,
+            "filters": {
+                "min_liquidity": min_liquidity,
+                "min_volume": min_volume,
+                "max_price_change_24h": max_price_change_24h,
+                "max_volume_liquidity_ratio": max_volume_liquidity_ratio
+            },
+            "blacklist": {
+                "coins": coin_blacklist.split("\n"),
+                "devs": dev_blacklist.split("\n")
+            }
+        }
+        save_config(config)
+        st.success("Configuration saved!")
+
+    # Main content
+    st.header("Bot Activity")
+    if st.button("Start Bot"):
+        with st.spinner("Running bot..."):
+            init_db()
+            token_addresses = ["0x...", "0x..."]  # Add token addresses to monitor
+            while True:
+                for token_address in token_addresses:
+                    if token_address in config["blacklist"]["coins"]:
+                        st.warning(f"Skipping blacklisted token: {token_address}")
+                        continue
+                    token_data = fetch_token_data(token_address)
+                    if token_data:
+                        token = token_data['pairs'][0]
+                        if is_blacklisted(token):
+                            st.warning(f"Skipping blacklisted token or dev: {token['baseToken']['symbol']}")
+                            continue
+                        if passes_filters(token):
+                            is_fake_volume = not validate_volume(token_address)
+                            if is_fake_volume:
+                                st.warning(f"Skipping token with fake volume: {token['baseToken']['symbol']}")
+                                continue
+                            rugcheck_status = check_rugcheck(token_address)
+                            if rugcheck_status != "Good":
+                                st.warning(f"Skipping token with bad Rugcheck status: {token['baseToken']['symbol']}")
+                                continue
+                            is_bundled = is_bundled_supply(token)
+                            if is_bundled:
+                                st.warning(f"Blacklisting token and dev due to bundled supply: {token['baseToken']['symbol']}")
+                                config["blacklist"]["coins"].append(token_address)
+                                config["blacklist"]["devs"].append(token['baseToken'].get('devAddress', ''))
+                                save_config(config)
+                                continue
+                            save_token_data(token_data, is_fake_volume, is_bundled, rugcheck_status)
+                            execute_trade(token_address, "buy")
+                            st.success(f"Buy signal for token: {token['baseToken']['symbol']}")
+                analyze_patterns()
+                time.sleep(config["update_interval"])
+
+    st.header("Analytics")
+    if st.button("Show Analytics"):
+        anomalies = analyze_patterns()
+        st.write("Anomalies detected:")
+        st.write(anomalies)
+
+if __name__ == "__main__":
+    main()
